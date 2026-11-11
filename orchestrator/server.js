@@ -1,13 +1,15 @@
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const { execFile } = require("child_process");
 
 const PORT = Number(process.env.PORT || 3000);
+const HOST = process.env.HOST || "127.0.0.1";
 const API_KEY = (process.env.WAHA_API_KEY || "").trim();
 const INTERNAL_KEY = API_KEY || "pokobot_internal_waha";
 const BASE_WEBHOOK_URL = (
-  process.env.WHATSAPP_HOOK_URL || "https://ping-clone-poc.vercel.app/api/webhook"
+  process.env.WHATSAPP_HOOK_URL || "https://pokobot.fluxy.id/api/webhook"
 ).trim();
 const DATA_DIR = process.env.DATA_DIR || "/opt/pokobot-waha";
 const REGISTRY_FILE = path.join(DATA_DIR, "registry.json");
@@ -16,6 +18,13 @@ const WAHA_IMAGE = process.env.WAHA_IMAGE || "devlikeapro/waha:latest";
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+
+function timingSafeEqualStr(a, b) {
+  const bufA = Buffer.from(String(a || ""), "utf8");
+  const bufB = Buffer.from(String(b || ""), "utf8");
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
 
 function readRegistry() {
   try {
@@ -40,6 +49,11 @@ function sanitizeSessionName(raw) {
   return cleaned || `wa-${Date.now()}`;
 }
 
+function extractPhoneDigits(jid) {
+  if (!jid) return "";
+  return String(jid).split("@")[0].replace(/[^0-9]/g, "");
+}
+
 function allocatePort(registry) {
   const used = new Set(Object.values(registry).map((item) => item.port));
   for (let p = 3101; p <= 3999; p++) {
@@ -59,10 +73,27 @@ function runDocker(args) {
   });
 }
 
-async function ensureContainer(sessionId, label, webhookUrl, owner = "") {
+async function destroySessionContainer(safeId) {
+  const containerName = `pokobot_waha_${safeId}`;
+  await runDocker(["rm", "-f", containerName]).catch(() => {});
+  fs.rmSync(path.join(SESSIONS_DIR, safeId), { recursive: true, force: true });
+  const reg = readRegistry();
+  if (reg[safeId]) {
+    delete reg[safeId];
+    writeRegistry(reg);
+  }
+}
+
+async function ensureContainer(sessionId, label, webhookUrl, owner) {
+  const cleanOwner = String(owner || "").trim().toLowerCase();
+  if (!cleanOwner || !cleanOwner.includes("@")) {
+    const err = new Error("Owner email is required");
+    err.statusCode = 401;
+    throw err;
+  }
+
   const reg = readRegistry();
   const safeId = sanitizeSessionName(sessionId);
-  const cleanOwner = String(owner || "").trim().toLowerCase();
   let entry = reg[safeId];
 
   if (!entry) {
@@ -71,22 +102,21 @@ async function ensureContainer(sessionId, label, webhookUrl, owner = "") {
       name: safeId,
       label: label || safeId,
       owner: cleanOwner,
+      phone: "",
       port,
       createdAt: new Date().toISOString(),
     };
     reg[safeId] = entry;
     writeRegistry(reg);
   } else {
-    let changed = false;
+    const existingOwner = String(entry.owner || "").trim().toLowerCase();
+    if (!existingOwner || existingOwner !== cleanOwner) {
+      const err = new Error("Session belongs to another user");
+      err.statusCode = 403;
+      throw err;
+    }
     if (label && entry.label !== label) {
       entry.label = label;
-      changed = true;
-    }
-    if (cleanOwner && !entry.owner) {
-      entry.owner = cleanOwner;
-      changed = true;
-    }
-    if (changed) {
       reg[safeId] = entry;
       writeRegistry(reg);
     }
@@ -96,7 +126,6 @@ async function ensureContainer(sessionId, label, webhookUrl, owner = "") {
   const sessionVol = path.join(SESSIONS_DIR, safeId);
   fs.mkdirSync(sessionVol, { recursive: true });
 
-  // Check if container exists
   let exists = false;
   let running = false;
   try {
@@ -110,7 +139,7 @@ async function ensureContainer(sessionId, label, webhookUrl, owner = "") {
   if (!exists) {
     const hookTarget = webhookUrl || BASE_WEBHOOK_URL;
     const sep = hookTarget.includes("?") ? "&" : "?";
-    const scopedHook = `${hookTarget}${sep}device=${encodeURIComponent(safeId)}&label=${encodeURIComponent(entry.label)}&owner=${encodeURIComponent(entry.owner || "")}`;
+    const scopedHook = `${hookTarget}${sep}device=${encodeURIComponent(safeId)}&label=${encodeURIComponent(entry.label)}&owner=${encodeURIComponent(entry.owner)}`;
 
     await runDocker([
       "run",
@@ -186,17 +215,75 @@ function proxyRequest(port, targetPath, method = "GET", bodyBuffer = null, extra
   });
 }
 
+async function checkPhoneConflict(currentEntry, phoneDigits) {
+  if (!phoneDigits) return null;
+  const reg = readRegistry();
+  const currentOwner = String(currentEntry.owner || "").toLowerCase();
+
+  for (const other of Object.values(reg)) {
+    if (!other || other.name === currentEntry.name) continue;
+    if ((other.owner || "").toLowerCase() === currentOwner) continue;
+    if (other.phone !== phoneDigits) continue;
+
+    // Verify if the other owner's container is STILL actively WORKING with that phone
+    try {
+      const otherRes = await proxyRequest(other.port, "/api/sessions/default", "GET");
+      if (otherRes.status >= 200 && otherRes.status < 300) {
+        const parsed = JSON.parse(otherRes.body.toString("utf8"));
+        const otherDigits = extractPhoneDigits(parsed?.me?.id);
+        if (parsed?.status === "WORKING" && otherDigits === phoneDigits) {
+          return other;
+        }
+      }
+    } catch {
+      // Other container offline
+    }
+  }
+  return null;
+}
+
 async function getSessionDetails(entry) {
   try {
     const res = await proxyRequest(entry.port, "/api/sessions/default", "GET");
     if (res.status >= 200 && res.status < 300) {
       const parsed = JSON.parse(res.body.toString("utf8"));
+      const liveStatus = parsed.status || "STARTING";
+      const me = parsed.me || null;
+      const phoneDigits = extractPhoneDigits(me?.id);
+
+      if (liveStatus === "WORKING" && phoneDigits) {
+        const conflict = await checkPhoneConflict(entry, phoneDigits);
+        if (conflict) {
+          // Immediately disconnect and purge duplicate phone session on the newer/conflicting tenant
+          await proxyRequest(entry.port, "/api/sessions/default/logout", "POST").catch(() => {});
+          await destroySessionContainer(entry.name);
+          return {
+            name: entry.name,
+            label: entry.label || entry.name,
+            owner: entry.owner || null,
+            status: "CONFLICT",
+            me: null,
+            error: "Nomor WhatsApp ini sedang aktif terhubung pada akun PokoBot lain.",
+            createdAt: entry.createdAt,
+          };
+        }
+
+        if (entry.phone !== phoneDigits) {
+          const reg = readRegistry();
+          if (reg[entry.name]) {
+            reg[entry.name].phone = phoneDigits;
+            writeRegistry(reg);
+          }
+          entry.phone = phoneDigits;
+        }
+      }
+
       return {
         name: entry.name,
         label: entry.label || entry.name,
         owner: entry.owner || null,
-        status: parsed.status || "STARTING",
-        me: parsed.me || null,
+        status: liveStatus,
+        me,
         createdAt: entry.createdAt,
       };
     }
@@ -225,62 +312,57 @@ function sendJson(res, status, data) {
   const payload = JSON.stringify(data);
   res.writeHead(status, {
     "Content-Type": "application/json",
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, X-Api-Key, Authorization",
   });
   res.end(payload);
 }
 
 const server = http.createServer(async (req, res) => {
-  if (req.method === "OPTIONS") {
-    res.writeHead(204, {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, X-Api-Key, Authorization",
-    });
-    return res.end();
-  }
-
   const parsedUrl = new URL(req.url, `http://127.0.0.1:${PORT}`);
   const pathname = parsedUrl.pathname;
 
-  // Health / Version endpoint (public)
+  // Health / Version endpoint (public minimal status)
   if (pathname === "/api/version" || pathname === "/health") {
     return sendJson(res, 200, {
-      version: "2026.11-multi-waha",
+      version: "2026.11-multi-waha-hardened",
       engine: "NOWEB",
       multiDevice: true,
       status: "ok",
     });
   }
 
-  // Enforce X-Api-Key on all operational endpoints
+  // Timing-safe X-Api-Key enforcement on all operational endpoints
   if (API_KEY) {
-    const provided = req.headers["x-api-key"] || parsedUrl.searchParams.get("apiKey") || "";
-    if (provided !== API_KEY) {
+    const provided = String(req.headers["x-api-key"] || "");
+    if (!timingSafeEqualStr(provided, API_KEY)) {
       return sendJson(res, 401, { error: "Unauthorized: Invalid X-Api-Key" });
     }
   }
 
+  // FAIL-CLOSED TENANT OWNER CHECK: require valid owner email on every session operation
   const ownerFilter = String(
     req.headers["x-owner-email"] || parsedUrl.searchParams.get("owner") || ""
   )
     .trim()
     .toLowerCase();
 
+  if (!ownerFilter || !ownerFilter.includes("@")) {
+    return sendJson(res, 401, {
+      error: "Unauthorized: X-Owner-Email header is required for multi-tenant isolation",
+    });
+  }
+
   const isAllowedOwner = (entry) => {
-    if (!ownerFilter) return true;
-    return (entry?.owner || "").toLowerCase() === ownerFilter;
+    const entryOwner = String(entry?.owner || "").trim().toLowerCase();
+    return Boolean(entryOwner && entryOwner === ownerFilter);
   };
 
   try {
-    // 1. LIST SESSIONS (Strictly scoped by owner when ?owner= or X-Owner-Email is provided)
+    // 1. LIST SESSIONS (Strictly scoped by verified ownerFilter)
     if (pathname === "/api/sessions" && req.method === "GET") {
       const reg = readRegistry();
       const entries = Object.values(reg).filter((entry) => isAllowedOwner(entry));
       const list = await Promise.all(entries.map((entry) => getSessionDetails(entry)));
-      return sendJson(res, 200, list);
+      return sendJson(res, 200, list.filter((item) => item.status !== "CONFLICT"));
     }
 
     // 2. CREATE / START SESSION WITH LABEL & OWNER
@@ -295,18 +377,24 @@ const server = http.createServer(async (req, res) => {
 
       const safeId = sanitizeSessionName(body.name || `wa-${Date.now()}`);
       const label = String(body.label || body.name || "WhatsApp Baru").trim();
-      const owner = String(body.owner || ownerFilter || "").trim().toLowerCase();
+      const bodyOwner = String(body.owner || ownerFilter).trim().toLowerCase();
+      if (bodyOwner !== ownerFilter) {
+        return sendJson(res, 403, { error: "Owner mismatch" });
+      }
+
       const webhookUrl = body?.config?.webhooks?.[0]?.url || BASE_WEBHOOK_URL;
 
       const reg = readRegistry();
-      if (reg[safeId] && owner && (reg[safeId].owner || "").toLowerCase() && (reg[safeId].owner || "").toLowerCase() !== owner) {
+      if (reg[safeId] && !isAllowedOwner(reg[safeId])) {
         return sendJson(res, 403, { error: "Session belongs to another user" });
       }
 
-      const entry = await ensureContainer(safeId, label, webhookUrl, owner);
+      const entry = await ensureContainer(safeId, label, webhookUrl, ownerFilter);
 
-      // Give freshly spawned container a moment to bind if needed
       let details = await getSessionDetails(entry);
+      if (details.status === "CONFLICT") {
+        return sendJson(res, 409, details);
+      }
       if (details.status === "STOPPED") {
         await proxyRequest(entry.port, "/api/sessions/default/start", "POST").catch(() => {});
         details = await getSessionDetails(entry);
@@ -327,6 +415,9 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 403, { error: "Forbidden" });
       }
       const details = await getSessionDetails(entry);
+      if (details.status === "CONFLICT") {
+        return sendJson(res, 409, details);
+      }
       return sendJson(res, 200, details);
     }
 
@@ -335,14 +426,14 @@ const server = http.createServer(async (req, res) => {
       const safeId = sanitizeSessionName(decodeURIComponent(sessionDetailMatch[1]));
       const reg = readRegistry();
       const entry = reg[safeId];
-      if (entry && !isAllowedOwner(entry)) {
+      if (!entry) {
+        return sendJson(res, 200, { ok: true, deleted: safeId });
+      }
+      if (!isAllowedOwner(entry)) {
         return sendJson(res, 403, { error: "Forbidden" });
       }
-      const containerName = `pokobot_waha_${safeId}`;
-      await runDocker(["rm", "-f", containerName]).catch(() => {});
-      fs.rmSync(path.join(SESSIONS_DIR, safeId), { recursive: true, force: true });
-      delete reg[safeId];
-      writeRegistry(reg);
+      await proxyRequest(entry.port, "/api/sessions/default/logout", "POST").catch(() => {});
+      await destroySessionContainer(safeId);
       return sendJson(res, 200, { ok: true, deleted: safeId });
     }
 
@@ -364,16 +455,12 @@ const server = http.createServer(async (req, res) => {
       if (action === "logout" || action === "stop") {
         await proxyRequest(entry.port, `/api/sessions/default/${action}`, "POST").catch(() => {});
         if (action === "logout") {
-          const containerName = `pokobot_waha_${safeId}`;
-          await runDocker(["rm", "-f", containerName]).catch(() => {});
-          fs.rmSync(path.join(SESSIONS_DIR, safeId), { recursive: true, force: true });
-          delete reg[safeId];
-          writeRegistry(reg);
+          await destroySessionContainer(safeId);
         }
         return sendJson(res, 200, { ok: true, status: "STOPPED" });
       }
 
-      await ensureContainer(safeId, entry.label, undefined, entry.owner);
+      await ensureContainer(safeId, entry.label, undefined, ownerFilter);
       const startRes = await proxyRequest(entry.port, "/api/sessions/default/start", "POST").catch(() => null);
       return sendJson(res, 200, { ok: true, upstream: startRes ? startRes.status : 202 });
     }
@@ -398,7 +485,6 @@ const server = http.createServer(async (req, res) => {
         );
         res.writeHead(qrRes.status, {
           "Content-Type": qrRes.headers["content-type"] || "application/json",
-          "Access-Control-Allow-Origin": "*",
         });
         return res.end(qrRes.body);
       } catch {
@@ -406,7 +492,31 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    // 7. SEND TEXT MESSAGE THROUGH SPECIFIC SESSION (no cross-tenant fallback)
+    // 7. READ CHATS FOR SPECIFIC OWNER SESSION (Scoped)
+    const chatsMatch = pathname.match(/^\/api\/([^/]+)\/chats$/);
+    if (chatsMatch && req.method === "GET") {
+      const safeId = sanitizeSessionName(decodeURIComponent(chatsMatch[1]));
+      const reg = readRegistry();
+      const entry = reg[safeId];
+      if (!entry) {
+        return sendJson(res, 200, []);
+      }
+      if (!isAllowedOwner(entry)) {
+        return sendJson(res, 403, { error: "Forbidden" });
+      }
+      const limit = Math.min(Number(parsedUrl.searchParams.get("limit")) || 10, 50);
+      try {
+        const chatsRes = await proxyRequest(entry.port, `/api/default/chats?limit=${limit}`, "GET");
+        res.writeHead(chatsRes.status, {
+          "Content-Type": chatsRes.headers["content-type"] || "application/json",
+        });
+        return res.end(chatsRes.body);
+      } catch {
+        return sendJson(res, 200, []);
+      }
+    }
+
+    // 8. SEND TEXT MESSAGE THROUGH SPECIFIC OWNED SESSION
     if (pathname === "/api/sendText" && req.method === "POST") {
       const rawBody = await readBody(req);
       let body = {};
@@ -427,6 +537,11 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 403, { error: "Forbidden: session belongs to another user" });
       }
 
+      const details = await getSessionDetails(entry);
+      if (details.status === "CONFLICT") {
+        return sendJson(res, 409, { error: details.error });
+      }
+
       const forwardBody = Buffer.from(
         JSON.stringify({
           ...body,
@@ -439,17 +554,16 @@ const server = http.createServer(async (req, res) => {
       });
       res.writeHead(upstream.status, {
         "Content-Type": upstream.headers["content-type"] || "application/json",
-        "Access-Control-Allow-Origin": "*",
       });
       return res.end(upstream.body);
     }
 
     return sendJson(res, 404, { error: `Route ${pathname} not found on PokoBot Multi-WAHA Orchestrator` });
   } catch (err) {
-    return sendJson(res, 500, { error: err.message || "Internal orchestrator error" });
+    return sendJson(res, err.statusCode || 500, { error: err.message || "Internal orchestrator error" });
   }
 });
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`[PokoBot Multi-WAHA Orchestrator] listening on 0.0.0.0:${PORT}`);
+server.listen(PORT, HOST, () => {
+  console.log(`[PokoBot Multi-WAHA Orchestrator] listening on ${HOST}:${PORT}`);
 });
