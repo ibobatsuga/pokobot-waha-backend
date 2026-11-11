@@ -36,7 +36,7 @@ function sanitizeSessionName(raw) {
     .replace(/[^a-z0-9_-]/g, "-")
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "")
-    .slice(0, 40);
+    .slice(0, 64);
   return cleaned || `wa-${Date.now()}`;
 }
 
@@ -59,9 +59,10 @@ function runDocker(args) {
   });
 }
 
-async function ensureContainer(sessionId, label, webhookUrl) {
+async function ensureContainer(sessionId, label, webhookUrl, owner = "") {
   const reg = readRegistry();
   const safeId = sanitizeSessionName(sessionId);
+  const cleanOwner = String(owner || "").trim().toLowerCase();
   let entry = reg[safeId];
 
   if (!entry) {
@@ -69,15 +70,26 @@ async function ensureContainer(sessionId, label, webhookUrl) {
     entry = {
       name: safeId,
       label: label || safeId,
+      owner: cleanOwner,
       port,
       createdAt: new Date().toISOString(),
     };
     reg[safeId] = entry;
     writeRegistry(reg);
-  } else if (label) {
-    entry.label = label;
-    reg[safeId] = entry;
-    writeRegistry(reg);
+  } else {
+    let changed = false;
+    if (label && entry.label !== label) {
+      entry.label = label;
+      changed = true;
+    }
+    if (cleanOwner && !entry.owner) {
+      entry.owner = cleanOwner;
+      changed = true;
+    }
+    if (changed) {
+      reg[safeId] = entry;
+      writeRegistry(reg);
+    }
   }
 
   const containerName = `pokobot_waha_${safeId}`;
@@ -98,7 +110,7 @@ async function ensureContainer(sessionId, label, webhookUrl) {
   if (!exists) {
     const hookTarget = webhookUrl || BASE_WEBHOOK_URL;
     const sep = hookTarget.includes("?") ? "&" : "?";
-    const scopedHook = `${hookTarget}${sep}device=${encodeURIComponent(safeId)}&label=${encodeURIComponent(entry.label)}`;
+    const scopedHook = `${hookTarget}${sep}device=${encodeURIComponent(safeId)}&label=${encodeURIComponent(entry.label)}&owner=${encodeURIComponent(entry.owner || "")}`;
 
     await runDocker([
       "run",
@@ -182,6 +194,7 @@ async function getSessionDetails(entry) {
       return {
         name: entry.name,
         label: entry.label || entry.name,
+        owner: entry.owner || null,
         status: parsed.status || "STARTING",
         me: parsed.me || null,
         createdAt: entry.createdAt,
@@ -193,6 +206,7 @@ async function getSessionDetails(entry) {
   return {
     name: entry.name,
     label: entry.label || entry.name,
+    owner: entry.owner || null,
     status: "STARTING",
     me: null,
     createdAt: entry.createdAt,
@@ -249,16 +263,27 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  const ownerFilter = String(
+    req.headers["x-owner-email"] || parsedUrl.searchParams.get("owner") || ""
+  )
+    .trim()
+    .toLowerCase();
+
+  const isAllowedOwner = (entry) => {
+    if (!ownerFilter) return true;
+    return (entry?.owner || "").toLowerCase() === ownerFilter;
+  };
+
   try {
-    // 1. LIST ALL SESSIONS
+    // 1. LIST SESSIONS (Strictly scoped by owner when ?owner= or X-Owner-Email is provided)
     if (pathname === "/api/sessions" && req.method === "GET") {
       const reg = readRegistry();
-      const entries = Object.values(reg);
+      const entries = Object.values(reg).filter((entry) => isAllowedOwner(entry));
       const list = await Promise.all(entries.map((entry) => getSessionDetails(entry)));
       return sendJson(res, 200, list);
     }
 
-    // 2. CREATE / START SESSION WITH LABEL
+    // 2. CREATE / START SESSION WITH LABEL & OWNER
     if (pathname === "/api/sessions" && req.method === "POST") {
       const rawBody = await readBody(req);
       let body = {};
@@ -270,9 +295,15 @@ const server = http.createServer(async (req, res) => {
 
       const safeId = sanitizeSessionName(body.name || `wa-${Date.now()}`);
       const label = String(body.label || body.name || "WhatsApp Baru").trim();
+      const owner = String(body.owner || ownerFilter || "").trim().toLowerCase();
       const webhookUrl = body?.config?.webhooks?.[0]?.url || BASE_WEBHOOK_URL;
 
-      const entry = await ensureContainer(safeId, label, webhookUrl);
+      const reg = readRegistry();
+      if (reg[safeId] && owner && (reg[safeId].owner || "").toLowerCase() && (reg[safeId].owner || "").toLowerCase() !== owner) {
+        return sendJson(res, 403, { error: "Session belongs to another user" });
+      }
+
+      const entry = await ensureContainer(safeId, label, webhookUrl, owner);
 
       // Give freshly spawned container a moment to bind if needed
       let details = await getSessionDetails(entry);
@@ -292,6 +323,9 @@ const server = http.createServer(async (req, res) => {
       if (!entry) {
         return sendJson(res, 404, { error: "Session not found" });
       }
+      if (!isAllowedOwner(entry)) {
+        return sendJson(res, 403, { error: "Forbidden" });
+      }
       const details = await getSessionDetails(entry);
       return sendJson(res, 200, details);
     }
@@ -300,8 +334,13 @@ const server = http.createServer(async (req, res) => {
     if (sessionDetailMatch && req.method === "DELETE") {
       const safeId = sanitizeSessionName(decodeURIComponent(sessionDetailMatch[1]));
       const reg = readRegistry();
+      const entry = reg[safeId];
+      if (entry && !isAllowedOwner(entry)) {
+        return sendJson(res, 403, { error: "Forbidden" });
+      }
       const containerName = `pokobot_waha_${safeId}`;
       await runDocker(["rm", "-f", containerName]).catch(() => {});
+      fs.rmSync(path.join(SESSIONS_DIR, safeId), { recursive: true, force: true });
       delete reg[safeId];
       writeRegistry(reg);
       return sendJson(res, 200, { ok: true, deleted: safeId });
@@ -318,19 +357,23 @@ const server = http.createServer(async (req, res) => {
       if (!entry) {
         return sendJson(res, 404, { error: "Session not found" });
       }
+      if (!isAllowedOwner(entry)) {
+        return sendJson(res, 403, { error: "Forbidden" });
+      }
 
       if (action === "logout" || action === "stop") {
         await proxyRequest(entry.port, `/api/sessions/default/${action}`, "POST").catch(() => {});
         if (action === "logout") {
           const containerName = `pokobot_waha_${safeId}`;
           await runDocker(["rm", "-f", containerName]).catch(() => {});
+          fs.rmSync(path.join(SESSIONS_DIR, safeId), { recursive: true, force: true });
           delete reg[safeId];
           writeRegistry(reg);
         }
         return sendJson(res, 200, { ok: true, status: "STOPPED" });
       }
 
-      await ensureContainer(safeId, entry.label);
+      await ensureContainer(safeId, entry.label, undefined, entry.owner);
       const startRes = await proxyRequest(entry.port, "/api/sessions/default/start", "POST").catch(() => null);
       return sendJson(res, 200, { ok: true, upstream: startRes ? startRes.status : 202 });
     }
@@ -340,7 +383,11 @@ const server = http.createServer(async (req, res) => {
     if (qrMatch && req.method === "GET") {
       const safeId = sanitizeSessionName(decodeURIComponent(qrMatch[1]));
       const reg = readRegistry();
-      const entry = reg[safeId] || (await ensureContainer(safeId, safeId));
+      if (reg[safeId] && !isAllowedOwner(reg[safeId])) {
+        return sendJson(res, 403, { error: "Forbidden" });
+      }
+      const label = parsedUrl.searchParams.get("label") || safeId;
+      const entry = reg[safeId] || (await ensureContainer(safeId, label, undefined, ownerFilter));
 
       try {
         const format = parsedUrl.searchParams.get("format") || "image";
@@ -359,7 +406,7 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    // 7. SEND TEXT MESSAGE THROUGH SPECIFIC SESSION
+    // 7. SEND TEXT MESSAGE THROUGH SPECIFIC SESSION (no cross-tenant fallback)
     if (pathname === "/api/sendText" && req.method === "POST") {
       const rawBody = await readBody(req);
       let body = {};
@@ -371,10 +418,13 @@ const server = http.createServer(async (req, res) => {
 
       const reg = readRegistry();
       const requested = sanitizeSessionName(body.session || "default");
-      const entry = reg[requested] || Object.values(reg)[0];
+      const entry = reg[requested];
 
       if (!entry) {
-        return sendJson(res, 404, { error: "Belum ada perangkat WhatsApp yang terhubung" });
+        return sendJson(res, 404, { error: "Perangkat WhatsApp untuk sesi ini belum terhubung" });
+      }
+      if (!isAllowedOwner(entry)) {
+        return sendJson(res, 403, { error: "Forbidden: session belongs to another user" });
       }
 
       const forwardBody = Buffer.from(
