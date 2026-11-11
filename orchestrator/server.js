@@ -5,6 +5,7 @@ const { execFile } = require("child_process");
 
 const PORT = Number(process.env.PORT || 3000);
 const API_KEY = (process.env.WAHA_API_KEY || "").trim();
+const INTERNAL_KEY = API_KEY || "pokobot_internal_waha";
 const BASE_WEBHOOK_URL = (
   process.env.WHATSAPP_HOOK_URL || "https://ping-clone-poc.vercel.app/api/webhook"
 ).trim();
@@ -117,6 +118,8 @@ async function ensureContainer(sessionId, label, webhookUrl) {
       "-e",
       "WHATSAPP_DEFAULT_ENGINE=NOWEB",
       "-e",
+      `WAHA_API_KEY=${INTERNAL_KEY}`,
+      "-e",
       "WAHA_PRINT_QR=false",
       "-e",
       "WHATSAPP_START_SESSION=default",
@@ -145,6 +148,7 @@ function proxyRequest(port, targetPath, method = "GET", bodyBuffer = null, extra
         method,
         timeout: 10000,
         headers: {
+          "X-Api-Key": INTERNAL_KEY,
           ...extraHeaders,
           ...(bodyBuffer ? { "Content-Length": bodyBuffer.length } : {}),
         },
