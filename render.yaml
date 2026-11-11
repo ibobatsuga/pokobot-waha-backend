@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: pokobot-waha-backend
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/version
+    disk:
+      name: waha-sessions
+      mountPath: /app/.sessions
+      sizeGB: 1
+    envVars:
+      - key: WHATSAPP_DEFAULT_ENGINE
+        value: NOWEB
+      - key: WHATSAPP_RESTART_ALL_SESSIONS
+        value: "True"
+      - key: WHATSAPP_START_SESSION
+        value: default
+      - key: WHATSAPP_HOOK_URL
+        value: https://ping-clone-poc.vercel.app/api/webhook
+      - key: WHATSAPP_HOOK_EVENTS
+        value: message,session.status
+      - key: WAHA_API_KEY
+        generateValue: true

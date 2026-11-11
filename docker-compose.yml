@@ -1,0 +1,34 @@
+services:
+  waha:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pokobot-waha-backend:latest
+    container_name: pokobot-waha-cloud
+    restart: unless-stopped
+    ports:
+      - "${WHATSAPP_API_PORT:-3000}:3000"
+    env_file:
+      - .env
+    environment:
+      - WHATSAPP_API_HOSTNAME=0.0.0.0
+      - WHATSAPP_API_PORT=3000
+      - WHATSAPP_DEFAULT_ENGINE=${WHATSAPP_DEFAULT_ENGINE:-NOWEB}
+      - WAHA_PRINT_QR=false
+      - WAHA_SWAGGER_ENABLED=${WAHA_SWAGGER_ENABLED:-true}
+      - WHATSAPP_START_SESSION=${WHATSAPP_START_SESSION:-default}
+      - WHATSAPP_RESTART_ALL_SESSIONS=True
+      - WHATSAPP_HOOK_URL=${WHATSAPP_HOOK_URL:-https://ping-clone-poc.vercel.app/api/webhook}
+      - WHATSAPP_HOOK_EVENTS=${WHATSAPP_HOOK_EVENTS:-message,session.status}
+    volumes:
+      - waha_sessions:/app/.sessions
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api/version || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  waha_sessions:
+    driver: local
