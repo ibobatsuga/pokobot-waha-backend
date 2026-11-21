@@ -84,6 +84,15 @@ async function destroySessionContainer(safeId) {
   }
 }
 
+async function resetAndStartSession(entry) {
+  try {
+    await proxyRequest(entry.port, "/api/sessions/default/stop", "POST").catch(() => {});
+    await new Promise((r) => setTimeout(r, 400));
+    await proxyRequest(entry.port, "/api/sessions/default/start", "POST").catch(() => {});
+    await new Promise((r) => setTimeout(r, 600));
+  } catch {}
+}
+
 async function ensureContainer(sessionId, label, webhookUrl, owner) {
   const cleanOwner = String(owner || "").trim().toLowerCase();
   if (!cleanOwner || !cleanOwner.includes("@")) {
@@ -461,6 +470,14 @@ const server = http.createServer(async (req, res) => {
       }
 
       await ensureContainer(safeId, entry.label, undefined, ownerFilter);
+      try {
+        const checkRes = await proxyRequest(entry.port, "/api/sessions/default", "GET");
+        const parsed = JSON.parse(checkRes.body.toString("utf8"));
+        if (parsed.status === "FAILED" || parsed.status === "STOPPED") {
+          await resetAndStartSession(entry);
+          return sendJson(res, 200, { ok: true, status: "STARTING" });
+        }
+      } catch {}
       const startRes = await proxyRequest(entry.port, "/api/sessions/default/start", "POST").catch(() => null);
       return sendJson(res, 200, { ok: true, upstream: startRes ? startRes.status : 202 });
     }
@@ -476,6 +493,17 @@ const server = http.createServer(async (req, res) => {
       const label = parsedUrl.searchParams.get("label") || safeId;
       const entry = reg[safeId] || (await ensureContainer(safeId, label, undefined, ownerFilter));
 
+      // Auto-recover if Baileys session in container has FAILED (e.g. previous QR timed out)
+      try {
+        const checkRes = await proxyRequest(entry.port, "/api/sessions/default", "GET");
+        if (checkRes.status >= 200 && checkRes.status < 300) {
+          const parsed = JSON.parse(checkRes.body.toString("utf8"));
+          if (parsed.status === "FAILED" || parsed.status === "STOPPED") {
+            await resetAndStartSession(entry);
+          }
+        }
+      } catch {}
+
       try {
         const format = parsedUrl.searchParams.get("format") || "image";
         const qrRes = await proxyRequest(
@@ -488,6 +516,7 @@ const server = http.createServer(async (req, res) => {
         });
         return res.end(qrRes.body);
       } catch {
+        resetAndStartSession(entry).catch(() => {});
         return sendJson(res, 202, { status: "STARTING", message: "WAHA container is booting" });
       }
     }
