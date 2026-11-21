@@ -511,10 +511,13 @@ const server = http.createServer(async (req, res) => {
           `/api/default/auth/qr?format=${encodeURIComponent(format)}`,
           "GET"
         );
-        res.writeHead(qrRes.status, {
-          "Content-Type": qrRes.headers["content-type"] || "application/json",
-        });
-        return res.end(qrRes.body);
+        if (qrRes.status >= 200 && qrRes.status < 300) {
+          res.writeHead(qrRes.status, {
+            "Content-Type": qrRes.headers["content-type"] || "application/json",
+          });
+          return res.end(qrRes.body);
+        }
+        return sendJson(res, 202, { status: "STARTING", message: "Menyiapkan QR Code WhatsApp..." });
       } catch {
         resetAndStartSession(entry).catch(() => {});
         return sendJson(res, 202, { status: "STARTING", message: "WAHA container is booting" });
@@ -579,6 +582,48 @@ const server = http.createServer(async (req, res) => {
       );
 
       const upstream = await proxyRequest(entry.port, "/api/sendText", "POST", forwardBody, {
+        "Content-Type": "application/json",
+      });
+      res.writeHead(upstream.status, {
+        "Content-Type": upstream.headers["content-type"] || "application/json",
+      });
+      return res.end(upstream.body);
+    }
+
+    // 9. SEND FILE / MEDIA THROUGH SPECIFIC OWNED SESSION
+    if (pathname === "/api/sendFile" && req.method === "POST") {
+      const rawBody = await readBody(req);
+      let body = {};
+      try {
+        body = JSON.parse(rawBody.toString("utf8") || "{}");
+      } catch {
+        return sendJson(res, 400, { error: "Invalid JSON" });
+      }
+
+      const reg = readRegistry();
+      const requested = sanitizeSessionName(body.session || "default");
+      const entry = reg[requested];
+
+      if (!entry) {
+        return sendJson(res, 404, { error: "Perangkat WhatsApp untuk sesi ini belum terhubung" });
+      }
+      if (!isAllowedOwner(entry)) {
+        return sendJson(res, 403, { error: "Forbidden: session belongs to another user" });
+      }
+
+      const details = await getSessionDetails(entry);
+      if (details.status === "CONFLICT") {
+        return sendJson(res, 409, { error: details.error });
+      }
+
+      const forwardBody = Buffer.from(
+        JSON.stringify({
+          ...body,
+          session: "default",
+        })
+      );
+
+      const upstream = await proxyRequest(entry.port, "/api/sendFile", "POST", forwardBody, {
         "Content-Type": "application/json",
       });
       res.writeHead(upstream.status, {
