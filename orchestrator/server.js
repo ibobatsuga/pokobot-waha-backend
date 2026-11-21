@@ -347,6 +347,49 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // System status endpoint for gateway health and connected phone number check
+  if (pathname === "/api/system-status" && req.method === "GET") {
+    const reg = readRegistry();
+    const ownerQuery = String(
+      req.headers["x-owner-email"] || parsedUrl.searchParams.get("owner") || ""
+    ).trim().toLowerCase();
+
+    let targetEntries = Object.values(reg);
+    if (ownerQuery && ownerQuery.includes("@")) {
+      targetEntries = targetEntries.filter((e) => (e.owner || "").toLowerCase() === ownerQuery);
+    }
+
+    const working = [];
+    for (const entry of targetEntries) {
+      try {
+        const details = await getSessionDetails(entry);
+        if (details.status === "WORKING" || details.phone || details.me?.id) {
+          working.push(details);
+        }
+      } catch {}
+    }
+
+    const primary = working[0] || null;
+    const phoneDigits = primary?.phone || extractPhoneDigits(primary?.me?.id) || null;
+
+    return sendJson(res, 200, {
+      status: "ok",
+      connected: Boolean(primary),
+      session: primary?.name || "default",
+      phone: phoneDigits ? `+${phoneDigits}` : null,
+      connected_number: phoneDigits || null,
+      push_name: primary?.me?.pushName || null,
+      working_count: working.length,
+      devices: working.map((w) => ({
+        name: w.name,
+        label: w.label,
+        phone: w.phone ? `+${w.phone}` : null,
+        owner: w.owner,
+        status: w.status,
+      })),
+    });
+  }
+
   // FAIL-CLOSED TENANT OWNER CHECK: require valid owner email on every session operation
   const ownerFilter = String(
     req.headers["x-owner-email"] || parsedUrl.searchParams.get("owner") || ""
