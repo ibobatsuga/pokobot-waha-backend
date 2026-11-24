@@ -188,7 +188,7 @@ async function ensureContainer(sessionId, label, webhookUrl, owner) {
   return entry;
 }
 
-function proxyRequest(port, targetPath, method = "GET", bodyBuffer = null, extraHeaders = {}) {
+function proxyRequest(port, targetPath, method = "GET", bodyBuffer = null, extraHeaders = {}, timeoutMs = 8000) {
   return new Promise((resolve, reject) => {
     const req = http.request(
       {
@@ -196,7 +196,7 @@ function proxyRequest(port, targetPath, method = "GET", bodyBuffer = null, extra
         port,
         path: targetPath,
         method,
-        timeout: 10000,
+        timeout: timeoutMs,
         headers: {
           "X-Api-Key": INTERNAL_KEY,
           ...extraHeaders,
@@ -236,7 +236,7 @@ async function checkPhoneConflict(currentEntry, phoneDigits) {
 
     // Verify if the other owner's container is STILL actively WORKING with that phone
     try {
-      const otherRes = await proxyRequest(other.port, "/api/sessions/default", "GET");
+      const otherRes = await proxyRequest(other.port, "/api/sessions/default", "GET", null, {}, 1500);
       if (otherRes.status >= 200 && otherRes.status < 300) {
         const parsed = JSON.parse(otherRes.body.toString("utf8"));
         const otherDigits = extractPhoneDigits(parsed?.me?.id);
@@ -253,7 +253,7 @@ async function checkPhoneConflict(currentEntry, phoneDigits) {
 
 async function getSessionDetails(entry) {
   try {
-    const res = await proxyRequest(entry.port, "/api/sessions/default", "GET");
+    const res = await proxyRequest(entry.port, "/api/sessions/default", "GET", null, {}, 2500);
     if (res.status >= 200 && res.status < 300) {
       const parsed = JSON.parse(res.body.toString("utf8"));
       const liveStatus = parsed.status || "STARTING";
@@ -578,13 +578,21 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 403, { error: "Forbidden" });
       }
       const label = parsedUrl.searchParams.get("label") || safeId;
-      const entry = reg[safeId] || (await ensureContainer(safeId, label, undefined, ownerFilter));
+      const entry = await ensureContainer(safeId, label, undefined, ownerFilter);
 
-      // Auto-recover if Baileys session in container has FAILED (e.g. previous QR timed out)
+      // Fast check session state (2000ms max)
       try {
-        const checkRes = await proxyRequest(entry.port, "/api/sessions/default", "GET");
+        const checkRes = await proxyRequest(entry.port, "/api/sessions/default", "GET", null, {}, 2000);
         if (checkRes.status >= 200 && checkRes.status < 300) {
           const parsed = JSON.parse(checkRes.body.toString("utf8"));
+          if (parsed.status === "WORKING") {
+            // Already connected! Return immediately so we don't hang on /auth/qr
+            return sendJson(res, 200, {
+              status: "WORKING",
+              me: parsed.me,
+              message: "WhatsApp is already connected",
+            });
+          }
           if (parsed.status === "FAILED" || parsed.status === "STOPPED") {
             await resetAndStartSession(entry);
           }
@@ -593,10 +601,14 @@ const server = http.createServer(async (req, res) => {
 
       try {
         const format = parsedUrl.searchParams.get("format") || "image";
+        // WAHA's QR endpoint long-polls. Cap wait to 3500ms so we respond promptly without timing out Vercel
         const qrRes = await proxyRequest(
           entry.port,
           `/api/default/auth/qr?format=${encodeURIComponent(format)}`,
-          "GET"
+          "GET",
+          null,
+          {},
+          3500
         );
         if (qrRes.status >= 200 && qrRes.status < 300) {
           res.writeHead(qrRes.status, {
@@ -606,8 +618,8 @@ const server = http.createServer(async (req, res) => {
         }
         return sendJson(res, 202, { status: "STARTING", message: "Menyiapkan QR Code WhatsApp..." });
       } catch {
-        resetAndStartSession(entry).catch(() => {});
-        return sendJson(res, 202, { status: "STARTING", message: "WAHA container is booting" });
+        // Do NOT call resetAndStartSession here; WAHA is busy generating QR or starting up
+        return sendJson(res, 202, { status: "STARTING", message: "Menyiapkan QR Code WhatsApp..." });
       }
     }
 
