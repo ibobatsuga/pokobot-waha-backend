@@ -325,6 +325,50 @@ function sendJson(res, status, data) {
   res.end(payload);
 }
 
+async function resolveSessionEntry(reg, requestedSession, ownerFilter) {
+  const sanitized = sanitizeSessionName(requestedSession || "default");
+  let entry = reg[sanitized];
+
+  // 1. If explicit entry found and belongs to owner, check if it is WORKING
+  if (entry && (entry.owner || "").toLowerCase() === ownerFilter) {
+    try {
+      const details = await getSessionDetails(entry);
+      if (details.status === "WORKING") {
+        return { entry, details };
+      }
+    } catch {}
+  }
+
+  // 2. If requested is default or not found/not working, search for ANY working session owned by this user
+  const ownerEntries = Object.values(reg).filter(
+    (e) => (e.owner || "").toLowerCase() === ownerFilter
+  );
+
+  for (const candidate of ownerEntries) {
+    if (candidate.name === sanitized) continue;
+    try {
+      const details = await getSessionDetails(candidate);
+      if (details.status === "WORKING") {
+        return { entry: candidate, details };
+      }
+    } catch {}
+  }
+
+  // 3. Fallback to requested entry if owned by user
+  if (entry && (entry.owner || "").toLowerCase() === ownerFilter) {
+    const details = await getSessionDetails(entry);
+    return { entry, details };
+  }
+
+  // 4. Fallback to first entry owned by user
+  if (ownerEntries.length > 0) {
+    const details = await getSessionDetails(ownerEntries[0]);
+    return { entry: ownerEntries[0], details };
+  }
+
+  return { entry: null, details: null };
+}
+
 const server = http.createServer(async (req, res) => {
   const parsedUrl = new URL(req.url, `http://127.0.0.1:${PORT}`);
   const pathname = parsedUrl.pathname;
@@ -572,12 +616,9 @@ const server = http.createServer(async (req, res) => {
     if (chatsMatch && req.method === "GET") {
       const safeId = sanitizeSessionName(decodeURIComponent(chatsMatch[1]));
       const reg = readRegistry();
-      const entry = reg[safeId];
+      const { entry } = await resolveSessionEntry(reg, safeId, ownerFilter);
       if (!entry) {
         return sendJson(res, 200, []);
-      }
-      if (!isAllowedOwner(entry)) {
-        return sendJson(res, 403, { error: "Forbidden" });
       }
       const limit = Math.min(Number(parsedUrl.searchParams.get("limit")) || 10, 50);
       try {
@@ -591,7 +632,7 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    // 8. SEND TEXT MESSAGE THROUGH SPECIFIC OWNED SESSION
+    // 8. SEND TEXT MESSAGE THROUGH SPECIFIC OWNED SESSION (Smart Auto-Routing to Working Device)
     if (pathname === "/api/sendText" && req.method === "POST") {
       const rawBody = await readBody(req);
       let body = {};
@@ -603,18 +644,22 @@ const server = http.createServer(async (req, res) => {
 
       const reg = readRegistry();
       const requested = sanitizeSessionName(body.session || "default");
-      const entry = reg[requested];
+      const { entry, details } = await resolveSessionEntry(reg, requested, ownerFilter);
 
       if (!entry) {
-        return sendJson(res, 404, { error: "Perangkat WhatsApp untuk sesi ini belum terhubung" });
-      }
-      if (!isAllowedOwner(entry)) {
-        return sendJson(res, 403, { error: "Forbidden: session belongs to another user" });
+        return sendJson(res, 404, {
+          error: "Perangkat WhatsApp untuk akun Anda belum terhubung. Silakan hubungkan WhatsApp di menu Device terlebih dahulu.",
+        });
       }
 
-      const details = await getSessionDetails(entry);
-      if (details.status === "CONFLICT") {
+      if (details && details.status === "CONFLICT") {
         return sendJson(res, 409, { error: details.error });
+      }
+
+      if (details && details.status !== "WORKING") {
+        return sendJson(res, 400, {
+          error: `WhatsApp Anda sedang tidak terhubung (status: ${details.status}). Silakan buka menu Device dan scan QR Code.`,
+        });
       }
 
       const forwardBody = Buffer.from(
@@ -633,7 +678,7 @@ const server = http.createServer(async (req, res) => {
       return res.end(upstream.body);
     }
 
-    // 9. SEND FILE / MEDIA THROUGH SPECIFIC OWNED SESSION
+    // 9. SEND FILE / MEDIA THROUGH SPECIFIC OWNED SESSION (Smart Auto-Routing to Working Device)
     if (pathname === "/api/sendFile" && req.method === "POST") {
       const rawBody = await readBody(req);
       let body = {};
@@ -645,18 +690,22 @@ const server = http.createServer(async (req, res) => {
 
       const reg = readRegistry();
       const requested = sanitizeSessionName(body.session || "default");
-      const entry = reg[requested];
+      const { entry, details } = await resolveSessionEntry(reg, requested, ownerFilter);
 
       if (!entry) {
-        return sendJson(res, 404, { error: "Perangkat WhatsApp untuk sesi ini belum terhubung" });
-      }
-      if (!isAllowedOwner(entry)) {
-        return sendJson(res, 403, { error: "Forbidden: session belongs to another user" });
+        return sendJson(res, 404, {
+          error: "Perangkat WhatsApp untuk akun Anda belum terhubung. Silakan hubungkan WhatsApp di menu Device terlebih dahulu.",
+        });
       }
 
-      const details = await getSessionDetails(entry);
-      if (details.status === "CONFLICT") {
+      if (details && details.status === "CONFLICT") {
         return sendJson(res, 409, { error: details.error });
+      }
+
+      if (details && details.status !== "WORKING") {
+        return sendJson(res, 400, {
+          error: `WhatsApp Anda sedang tidak terhubung (status: ${details.status}). Silakan buka menu Device dan scan QR Code.`,
+        });
       }
 
       const forwardBody = Buffer.from(
