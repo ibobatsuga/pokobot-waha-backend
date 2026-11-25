@@ -54,6 +54,56 @@ function extractPhoneDigits(jid) {
   return String(jid).split("@")[0].replace(/[^0-9]/g, "");
 }
 
+function inferMimeAndFilename(fileObj = {}) {
+  let { url, data, mimetype, filename } = fileObj;
+  const cleanUrlPath = typeof url === "string" ? url.split("?")[0].split("#")[0] : "";
+
+  if (!filename && cleanUrlPath) {
+    const base = cleanUrlPath.split("/").pop();
+    if (base && base.includes(".")) {
+      filename = decodeURIComponent(base);
+    }
+  }
+
+  const extSource = (filename || cleanUrlPath || "").toLowerCase();
+  if (!mimetype) {
+    if (extSource.endsWith(".jpg") || extSource.endsWith(".jpeg")) mimetype = "image/jpeg";
+    else if (extSource.endsWith(".png")) mimetype = "image/png";
+    else if (extSource.endsWith(".webp")) mimetype = "image/webp";
+    else if (extSource.endsWith(".gif")) mimetype = "image/gif";
+    else if (extSource.endsWith(".pdf")) mimetype = "application/pdf";
+    else if (extSource.endsWith(".doc")) mimetype = "application/msword";
+    else if (extSource.endsWith(".docx"))
+      mimetype = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    else if (extSource.endsWith(".xls")) mimetype = "application/vnd.ms-excel";
+    else if (extSource.endsWith(".xlsx"))
+      mimetype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+    else if (extSource.endsWith(".csv")) mimetype = "text/csv";
+    else if (extSource.endsWith(".txt")) mimetype = "text/plain";
+    else if (extSource.endsWith(".zip")) mimetype = "application/zip";
+    else if (extSource.endsWith(".mp4")) mimetype = "video/mp4";
+    else if (extSource.endsWith(".mp3")) mimetype = "audio/mpeg";
+  }
+
+  if (!filename) {
+    if (mimetype && mimetype.startsWith("image/")) {
+      const sub = mimetype.split("/")[1]?.split(";")[0] || "jpg";
+      filename = `image.${sub === "jpeg" ? "jpg" : sub}`;
+    } else if (mimetype === "application/pdf") {
+      filename = "document.pdf";
+    } else {
+      filename = "file";
+    }
+  }
+
+  return {
+    ...(url ? { url } : {}),
+    ...(data ? { data } : {}),
+    ...(mimetype ? { mimetype } : {}),
+    ...(filename ? { filename } : {}),
+  };
+}
+
 function allocatePort(registry) {
   const used = new Set(Object.values(registry).map((item) => item.port));
   for (let p = 3101; p <= 3999; p++) {
@@ -124,7 +174,7 @@ async function ensureContainer(sessionId, label, webhookUrl, owner) {
       err.statusCode = 403;
       throw err;
     }
-    if (label && entry.label !== label) {
+    if (label && label !== safeId && entry.label !== label) {
       entry.label = label;
       reg[safeId] = entry;
       writeRegistry(reg);
@@ -690,8 +740,8 @@ const server = http.createServer(async (req, res) => {
       return res.end(upstream.body);
     }
 
-    // 9. SEND FILE / MEDIA THROUGH SPECIFIC OWNED SESSION (Smart Auto-Routing to Working Device)
-    if (pathname === "/api/sendFile" && req.method === "POST") {
+    // 9. SEND FILE / IMAGE / MEDIA THROUGH SPECIFIC OWNED SESSION (Smart Auto-Routing to Working Device)
+    if ((pathname === "/api/sendFile" || pathname === "/api/sendImage") && req.method === "POST") {
       const rawBody = await readBody(req);
       let body = {};
       try {
@@ -720,16 +770,43 @@ const server = http.createServer(async (req, res) => {
         });
       }
 
+      const normalizedFile = inferMimeAndFilename(body.file || {});
+      const isImageMedia =
+        pathname === "/api/sendImage" ||
+        body.asImage === true ||
+        (body.asDocument !== true &&
+          /^image\/(jpeg|jpg|png|webp|gif)$/i.test(String(normalizedFile.mimetype || "")));
+
       const forwardBody = Buffer.from(
         JSON.stringify({
           ...body,
+          file: normalizedFile,
           session: "default",
         })
       );
 
-      const upstream = await proxyRequest(entry.port, "/api/sendFile", "POST", forwardBody, {
-        "Content-Type": "application/json",
-      });
+      const primaryPath = isImageMedia ? "/api/sendImage" : "/api/sendFile";
+      let upstream = await proxyRequest(
+        entry.port,
+        primaryPath,
+        "POST",
+        forwardBody,
+        { "Content-Type": "application/json" },
+        25000
+      );
+
+      // Automatic fallback to /api/sendFile if /api/sendImage fails on exotic image formats
+      if (isImageMedia && upstream.status >= 400 && pathname === "/api/sendFile") {
+        upstream = await proxyRequest(
+          entry.port,
+          "/api/sendFile",
+          "POST",
+          forwardBody,
+          { "Content-Type": "application/json" },
+          25000
+        );
+      }
+
       res.writeHead(upstream.status, {
         "Content-Type": upstream.headers["content-type"] || "application/json",
       });
